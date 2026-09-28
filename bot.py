@@ -1,3 +1,19 @@
+# Telegram Device Verification Bot
+# Updated flow:
+# 1) User opens the Telegram Mini App.
+# 2) Server verifies Telegram initData and binds the Telegram user to a device fingerprint.
+# 3) On success/failure the Mini App closes and the bot sends the corresponding result.
+# NOTE: Browsers/Mini Apps cannot access IMEI/MAC/hardware serials. Device binding is
+# best-effort using available client signals + Telegram user binding.
+#
+# Render:
+#   Build: pip install -r requirements.txt
+#   Start: python bot.py
+#
+# Environment:
+#   BOT_TOKEN=...
+#   WEB_APP_URL=https://your-service.onrender.com
+
 import os, json, time, hmac, hashlib, sqlite3
 from threading import Thread
 from urllib.parse import parse_qsl
@@ -371,3 +387,160 @@ def main():
 
 if __name__=="__main__":
     main()
+
+
+
+import os, time, json, hmac, hashlib, secrets, asyncio
+from pathlib import Path
+from urllib.parse import parse_qsl, urlencode
+
+from aiohttp import web
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+WEB_APP_URL = os.environ.get("WEB_APP_URL", "").strip().rstrip("/")
+PORT = int(os.environ.get("PORT", "10000"))
+DB_FILE = Path(os.environ.get("DB_FILE", "device_store.json"))
+
+SUCCESS_TEXT = "✅ Your verification is successful."
+FAIL_TEXT = "❌ Your verification failed. Please refer new friends and try again."
+
+def load_db():
+    try:
+        return json.loads(DB_FILE.read_text("utf-8"))
+    except Exception:
+        return {"users": {}, "devices": {}}
+
+DB = load_db()
+
+def save_db():
+    tmp = DB_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(DB, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(DB_FILE)
+
+def device_key(client):
+    # Best-effort browser/app fingerprint. Never treated as a hardware ID.
+    raw = "|".join(str(client.get(k, "")) for k in (
+        "platform", "telegramVersion", "colorScheme", "language",
+        "timezone", "screen", "userAgent", "storageId"
+    ))
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+def verify_telegram_init_data(init_data):
+    if not init_data or not BOT_TOKEN:
+        return None
+    try:
+        pairs = dict(parse_qsl(init_data, keep_blank_values=True))
+        received = pairs.pop("hash", None)
+        if not received or "auth_date" not in pairs:
+            return None
+        secret = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+        check = "\n".join(f"{k}={pairs[k]}" for k in sorted(pairs))
+        calculated = hmac.new(secret, check.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(calculated, received):
+            return None
+        user = json.loads(pairs.get("user", "{}"))
+        # Reject very old initData.
+        if time.time() - int(pairs["auth_date"]) > 86400:
+            return None
+        return user
+    except Exception:
+        return None
+
+async def api_verify(request):
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"status": "rejected", "reason": "CHECK_FAILED"}, status=400)
+
+    user = verify_telegram_init_data(request.headers.get("Authorization", "").removeprefix("tma ").strip())
+    if not user:
+        return web.json_response({"status": "rejected", "reason": "CHECK_FAILED"}, status=403)
+
+    uid = str(user.get("id"))
+    client = body.get("client") or {}
+    dkey = device_key(client)
+    ref = "VRF-" + secrets.token_hex(4).upper() + "-" + secrets.token_hex(2).upper()
+
+    # One verified device binding. Same Telegram account cannot claim another device,
+    # and a known device cannot be claimed by a different Telegram account.
+    existing_user = DB["users"].get(uid)
+    existing_device = DB["devices"].get(dkey)
+
+    if existing_user and existing_user.get("verified"):
+        return web.json_response({
+            "status": "rejected",
+            "reason": "DEVICE_ALREADY_LINKED",
+            "referenceId": existing_user.get("referenceId", ref)
+        })
+
+    if existing_device and existing_device.get("user_id") != uid:
+        return web.json_response({
+            "status": "rejected",
+            "reason": "DEVICE_ALREADY_LINKED",
+            "referenceId": existing_device.get("referenceId", ref)
+        })
+
+    record = {"user_id": uid, "referenceId": ref, "verifiedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    DB["users"][uid] = {"verified": True, **record}
+    DB["devices"][dkey] = record
+    save_db()
+
+    return web.json_response({"status": "verified", **record})
+
+async def health(request):
+    return web.Response(text="OK")
+
+async def bot_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not WEB_APP_URL:
+        await update.message.reply_text("WEB_APP_URL is not configured.")
+        return
+    kb = [[InlineKeyboardButton(
+        "🛡️ Verify Device",
+        web_app=WebAppInfo(url=WEB_APP_URL)
+    )]]
+    await update.message.reply_text(
+        "🔐 *Device Verification*\n\nTap below to securely verify your device.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(kb)
+    )
+
+async def web_app_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Kept for compatibility if the Mini App sends Telegram WebAppData.
+    await update.message.reply_text("Please use the Verify Device button to start verification.")
+
+async def run():
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN is missing")
+    if not WEB_APP_URL:
+        raise RuntimeError("WEB_APP_URL is missing")
+
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler(["start", "verify"], bot_start))
+    app.add_handler(MessageHandler(filters.StatusUpdate.WEB_APP_DATA, web_app_data))
+
+    runner = web.AppRunner(web.Application())
+    http = web.Application()
+    http.router.add_get("/", health)
+    http.router.add_get("/health", health)
+    http.router.add_post("/v1/device/verify", api_verify)
+    runner = web.AppRunner(http)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    finally:
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
+        await runner.cleanup()
+
+if __name__ == "__main__":
+    asyncio.run(run())
